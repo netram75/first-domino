@@ -1,0 +1,6 @@
+.venv/
+raw/
+public/
+private/
+*submission*.csv
+__pycache__/
