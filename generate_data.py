@@ -35,7 +35,7 @@ NAMES = {
     },
 }
 
-FAULTS = {"train": ["slow", "errors", "crash", "cpu"], "test": ["leak", "partial"]}
+FAULTS = {"train": ["slow", "errors", "crash", "cpu", "gray"], "test": ["leak", "partial"]}
 TIMEOUTS = [50, 100, 200, 300, 500, 800, 1000, 2000, 3000, 5000]
 
 
@@ -100,6 +100,8 @@ def make_system(r, split):
         info["verbose"] = 1.0 if r.random() < 0.3 else r.uniform(0.02, 0.3)  # how much it logs per error
         info["cpu_idle"] = r.uniform(3, 10)
         info["cpu_normal"] = r.uniform(15, 50)
+        # health check also pings its dependencies -> restarts when they fail (bad idea, but common)
+        info["deep_health"] = kind in ("gateway", "service") and r.random() < 0.25
 
     for key in edges:
         calls = 1
@@ -114,6 +116,7 @@ def make_system(r, split):
     normal_lat = {}
     for n in order:
         normal_lat[n] = nodes[n]["own_lat"] + sum(e["calls"] * normal_lat[b] for (a, b), e in edges.items() if a == n)
+        nodes[n]["normal_lat"] = normal_lat[n]
     for (a, b), e in edges.items():
         want = normal_lat[b] * r.uniform(4, 10)
         e["timeout_ms"] = next((x for x in TIMEOUTS if x >= want), TIMEOUTS[-1])
@@ -138,13 +141,16 @@ def pick_roots(r, system, split):
     n_roots = 2 if r.random() < (0.25 if split == "test" else 0.05) else 1
     t0 = r.randint(15, 32)
     roots = []
+    n_callers = {n: sum(b == n for _, b in system["edges"]) for n in names}
     for i in range(n_roots):
-        options = [n for n in names if n not in [f["service"] for f in roots]]
-        service = r.choices(options, weights=[weight[nodes[n]["kind"]] for n in options])[0]
         if split == "test" and r.random() < 0.45:
             kind = r.choice(FAULTS["test"])
         else:
             kind = r.choice(FAULTS["train"])
+        options = [n for n in names if n not in [f["service"] for f in roots]]
+        if kind == "gray":  # usually a shared thing (db, cache...) behind a bad network link
+            options = [n for n in options if n_callers[n] >= 2] or options
+        service = r.choices(options, weights=[weight[nodes[n]["kind"]] for n in options])[0]
         roots.append({"service": service, "kind": kind, "t0": t0 if i == 0 else min(38, max(10, t0 + r.randint(-5, 5)))})
     return roots
 
@@ -185,7 +191,7 @@ def lagged(a, d):
     return a if d == 0 else np.concatenate([np.repeat(a[:1], d), a[:-d]])
 
 
-def apply_fault(rng, f, own_lat, own_err, cpu_extra, down, t):
+def apply_fault(rng, f, own_lat, own_err, cpu_extra, down, lost, t):
     s, kind, t0 = f["service"], f["kind"], f["t0"]
     step = np.clip(t - t0 + rng.uniform(0.2, 1), 0, 1)  # first minute is only partly broken
     if kind == "slow":
@@ -203,6 +209,8 @@ def apply_fault(rng, f, own_lat, own_err, cpu_extra, down, t):
         own_lat[s] = own_lat[s] * (1 + ramp * (rng.uniform(4, 8) - 1))
         own_err[s] = own_err[s] + ramp ** 3 * rng.uniform(0.05, 0.2)
         cpu_extra[s] += ramp * rng.uniform(10, 25)
+    elif kind == "gray":  # network to it drops requests. it looks fine itself, callers time out
+        lost[s] = step * rng.uniform(0.15, 0.5)
     elif kind == "crash":  # crash loop: down a few minutes, up, down again
         m = t0
         while m < MINUTES:
@@ -221,6 +229,7 @@ def simulate(r, system, roots, noise):
     own_err = {n: np.full(MINUTES, info["base_err"]) for n, info in nodes.items()}
     cpu_extra = {n: np.zeros(MINUTES) for n in nodes}
     down = {n: np.zeros(MINUTES, bool) for n in nodes}
+    lost = {n: np.zeros(MINUTES) for n in nodes}
 
     for n in noise["flaky"]:
         own_err[n] = rng.uniform(0.02, 0.06) + (rng.random(MINUTES) < 0.12) * rng.uniform(0.05, 0.15, MINUTES)
@@ -232,24 +241,37 @@ def simulate(r, system, roots, noise):
         own_lat[n][minute] *= 1.6  # restart blip
         cpu_extra[n][minute] += 15
     for f in roots:
-        apply_fault(rng, f, own_lat, own_err, cpu_extra, down, t)
+        apply_fault(rng, f, own_lat, own_err, cpu_extra, down, lost, t)
 
     # latency and errors flow up from callees to callers
     lat, err, tries = {}, {}, {}
     for n in order:
         total = own_lat[n].copy()
         ok = 1 - np.clip(own_err[n], 0, 1)
+        worst = np.zeros(MINUTES)
         for c in callees[n]:
             e = edges[(n, c)]
-            lc, ec = lagged(lat[c], e["lag"]), lagged(err[c], e["lag"])
+            lc, ec, lc_lost = lagged(lat[c], e["lag"]), lagged(err[c], e["lag"]), lagged(lost[c], e["lag"])
             timed_out = sigmoid(8 * (lc / e["timeout_ms"] - 1))
-            q = 1 - (1 - ec) * (1 - timed_out)  # one attempt fails
+            q = 1 - (1 - ec) * (1 - timed_out) * (1 - lc_lost)  # one attempt fails
             attempts = sum(q ** i for i in range(e["retries"] + 1))
-            total = total + e["calls"] * np.minimum(lc, e["timeout_ms"]) * attempts
+            wait = np.minimum(lc, e["timeout_ms"]) * (1 - lc_lost) + e["timeout_ms"] * lc_lost
+            total = total + e["calls"] * wait * attempts
             ok = ok * (1 - q ** (e["retries"] + 1)) ** e["calls"]
             tries[(n, c)] = attempts
-        lat[n] = total
+            worst = np.maximum(worst, q)
+        if nodes[n]["deep_health"]:
+            m = 1
+            while m < MINUTES:
+                if worst[m] > 0.5 and worst[m - 1] > 0.5:
+                    down[n][m + 1:m + 3] = True
+                    m += 6  # cooldown before it can restart again
+                else:
+                    m += 1
+        lat[n] = np.where(down[n], own_lat[n], total)
         err[n] = np.where(down[n], 1.0, 1 - ok)
+        # requests piling up while waiting cost cpu too
+        cpu_extra[n] += 8 * np.clip(np.log2(total / nodes[n]["normal_lat"]), 0, 3)
 
     # traffic flows down. retries mean more traffic to whoever is failing
     rps = {n: np.zeros(MINUTES) for n in nodes}
@@ -261,7 +283,7 @@ def simulate(r, system, roots, noise):
             rps[n] = nodes[n]["rps"] * trend * rng.lognormal(0, 0.03, MINUTES)
         sending = np.where(down[n], 0, rps[n])
         for c in callees[n]:
-            rps[c] = rps[c] + sending * edges[(n, c)]["calls"] * tries[(n, c)]
+            rps[c] = rps[c] + sending * edges[(n, c)]["calls"] * tries[(n, c)] * (1 - lost[c])
 
     cols = {k: [] for k in ("service", "minute", "rps", "latency_ms", "error_rate", "cpu", "log_errors")}
     for n, info in nodes.items():
