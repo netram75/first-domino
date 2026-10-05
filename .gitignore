@@ -4,3 +4,4 @@ public/
 private/
 *submission*.csv
 __pycache__/
+.pytest_cache/
