@@ -1,5 +1,7 @@
 # first-domino
 
+![ci](https://github.com/netram75/first-domino/actions/workflows/ci.yml/badge.svg)
+
 Something broke in a system of 15-40 services, and now half of them are red. Find the one that started it.
 
 Chaos engineering tools break services on purpose to see what happens. This is the other side of that: the breaking already happened, you only see the metrics, and you have to work out the cause.
@@ -28,6 +30,7 @@ For each incident you get the call graph (with retries and timeouts), 45 minutes
 - `solution.py` - reference model, per-service anomaly features + call graph features
 - `problem.md` - the task as a solver sees it
 - `rubrics.md` - how to judge a solution beyond the score
+- `tests/` - grader math, bad submissions, and checks on the simulator
 
 ## Run it
 
@@ -39,7 +42,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python grade.py --submission submission.csv --by-split --by-fault
 ```
 
-Or just `./run_all.sh`, it does all of the above plus both baselines. Takes under a minute on a laptop.
+Or just `./run_all.sh`, it does all of the above plus both baselines. Takes under a minute on a laptop. Tests: `.venv/bin/python -m pytest -q`
 
 ## Results
 

@@ -1,0 +1,22 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest -q
+      - name: small end to end run
+        run: |
+          python generate_data.py --n-train 300 --n-test 150
+          python prepare.py --n-holdout 80
+          python baseline.py public submission_loudest.csv --rule loudest
+          python baseline.py public submission_first.csv --rule first
+          python solution.py public submission.csv
+          python grade.py --submission submission.csv --by-split --by-fault
