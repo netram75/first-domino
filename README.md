@@ -39,7 +39,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python grade.py --submission submission.csv --by-split --by-fault
 ```
 
-The whole thing runs in under a minute on a laptop.
+Or just `./run_all.sh`, it does all of the above plus both baselines. Takes under a minute on a laptop.
 
 ## Results
 
