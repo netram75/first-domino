@@ -8,6 +8,8 @@ Chaos engineering tools break services on purpose to see what happens. This is t
 
 I built it as a small ML challenge: a simulator that makes the incidents, a public/private split, a grader, two simple baselines, a reference solution and rubrics.
 
+Also on Kaggle: the [dataset](https://www.kaggle.com/datasets/netramfaran/first-domino-root-cause-incidents) and a [notebook](https://www.kaggle.com/code/netramfaran/first-domino-finding-the-root-cause) that walks through the baselines, the model with and without the call graph, and where it still fails.
+
 ## The task
 
 ```
