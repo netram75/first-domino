@@ -1,6 +1,7 @@
 # simulates small microservice systems and breaks one (sometimes two) of the services
 # train pool = normal incidents
 # test pool = shifted: bigger systems, new failure types, third party apis, more noise
+# v2: host clocks drift, some services report no metrics, a dead cache can take its db down with it
 # everything is random, nothing real
 
 import argparse
@@ -11,6 +12,8 @@ import numpy as np
 import pandas as pd
 
 MINUTES = 45
+MAX_SKEW = 3  # host clocks can be up to 3 minutes off
+SIM = MINUTES + 2 * MAX_SKEW  # simulate a bit more so every host has a full 45 minutes
 
 NAMES = {
     "train": {
@@ -102,6 +105,20 @@ def make_system(r, split):
         info["cpu_normal"] = r.uniform(15, 50)
         # health check also pings its dependencies -> restarts when they fail (bad idea, but common)
         info["deep_health"] = kind in ("gateway", "service") and r.random() < 0.25
+        # third party apis never send metrics, some managed stores don't either
+        hidden = {"external": 1.0, "service": 0.05}.get(kind, 0.4 if big else 0.3)
+        info["observed"] = kind == "gateway" or r.random() >= hidden
+        # every host stamps its own metrics and about half the clocks are off
+        info["skew"] = r.choice([-3, -2, -1, 1, 2, 3]) if r.random() < 0.5 else 0
+
+    # cache-aside: whoever reads a cache can also hit the db behind it, and does on a miss
+    dbs = [m for m in nodes if nodes[m]["kind"] == "db"]
+    for name, info in nodes.items():
+        if info["kind"] == "cache" and dbs:
+            info["backing"] = r.choice(dbs)
+            for a, b in list(edges):
+                if b == name:
+                    edges.setdefault((a, info["backing"]), None)
 
     for key in edges:
         calls = 1
@@ -130,6 +147,7 @@ def make_system(r, split):
                 normal_rps[b] += normal_rps[n] * e["calls"]
     for n, info in nodes.items():
         info["cpu_per_rps"] = (info["cpu_normal"] - info["cpu_idle"]) / max(normal_rps[n], 1)
+        info["normal_rps"] = max(normal_rps[n], 1)
 
     return {"nodes": nodes, "edges": edges, "order": order}
 
@@ -213,43 +231,22 @@ def apply_fault(rng, f, own_lat, own_err, cpu_extra, down, lost, t):
         lost[s] = step * rng.uniform(0.15, 0.5)
     elif kind == "crash":  # crash loop: down a few minutes, up, down again
         m = t0
-        while m < MINUTES:
+        while m < SIM:
             d = int(rng.integers(2, 5))
             down[s][m:m + d] = True
             m += d + int(rng.integers(2, 6))
 
 
-def simulate(r, system, roots, noise):
-    nodes, edges, order = system["nodes"], system["edges"], system["order"]
-    rng = np.random.default_rng(r.getrandbits(32))
-    t = np.arange(MINUTES)
-    callees = {n: [b for (a, b) in edges if a == n] for n in nodes}
-
-    own_lat = {n: info["own_lat"] * rng.lognormal(0, 0.04, MINUTES) for n, info in nodes.items()}
-    own_err = {n: np.full(MINUTES, info["base_err"]) for n, info in nodes.items()}
-    cpu_extra = {n: np.zeros(MINUTES) for n in nodes}
-    down = {n: np.zeros(MINUTES, bool) for n in nodes}
-    lost = {n: np.zeros(MINUTES) for n in nodes}
-
-    for n in noise["flaky"]:
-        own_err[n] = rng.uniform(0.02, 0.06) + (rng.random(MINUTES) < 0.12) * rng.uniform(0.05, 0.15, MINUTES)
-    for n, period, offset in noise["cron"]:
-        busy = ((t - offset) % period) < 2
-        own_lat[n] = own_lat[n] * np.where(busy, rng.uniform(2, 4), 1)
-        cpu_extra[n] += busy * rng.uniform(25, 40)
-    for n, minute in noise["deploys"]:
-        own_lat[n][minute] *= 1.6  # restart blip
-        cpu_extra[n][minute] += 15
-    for f in roots:
-        apply_fault(rng, f, own_lat, own_err, cpu_extra, down, lost, t)
-
+def propagate(system, own_lat, own_err, down, lost):
     # latency and errors flow up from callees to callers
-    lat, err, tries = {}, {}, {}
-    for n in order:
+    nodes, edges = system["nodes"], system["edges"]
+    lat, err, tries, failed, waiting = {}, {}, {}, {}, {}
+    down = {n: d.copy() for n, d in down.items()}
+    for n in system["order"]:
         total = own_lat[n].copy()
         ok = 1 - np.clip(own_err[n], 0, 1)
-        worst = np.zeros(MINUTES)
-        for c in callees[n]:
+        worst = np.zeros(SIM)
+        for c in system["callees"][n]:
             e = edges[(n, c)]
             lc, ec, lc_lost = lagged(lat[c], e["lag"]), lagged(err[c], e["lag"]), lagged(lost[c], e["lag"])
             timed_out = sigmoid(8 * (lc / e["timeout_ms"] - 1))
@@ -257,12 +254,18 @@ def simulate(r, system, roots, noise):
             attempts = sum(q ** i for i in range(e["retries"] + 1))
             wait = np.minimum(lc, e["timeout_ms"]) * (1 - lc_lost) + e["timeout_ms"] * lc_lost
             total = total + e["calls"] * wait * attempts
-            ok = ok * (1 - q ** (e["retries"] + 1)) ** e["calls"]
             tries[(n, c)] = attempts
-            worst = np.maximum(worst, q)
+            failed[(n, c)] = q ** (e["retries"] + 1)
+            backing = nodes[c].get("backing")
+            if backing:
+                # a cache miss isn't an error, it just goes to the db instead
+                total = total + e["calls"] * failed[(n, c)] * lat[backing]
+            else:
+                ok = ok * (1 - failed[(n, c)]) ** e["calls"]
+                worst = np.maximum(worst, q)
         if nodes[n]["deep_health"]:
             m = 1
-            while m < MINUTES:
+            while m < SIM:
                 if worst[m] > 0.5 and worst[m - 1] > 0.5:
                     down[n][m + 1:m + 3] = True
                     m += 6  # cooldown before it can restart again
@@ -271,36 +274,95 @@ def simulate(r, system, roots, noise):
         lat[n] = np.where(down[n], own_lat[n], total)
         err[n] = np.where(down[n], 1.0, 1 - ok)
         # requests piling up while waiting cost cpu too
-        cpu_extra[n] += 8 * np.clip(np.log2(total / nodes[n]["normal_lat"]), 0, 3)
+        waiting[n] = 8 * np.clip(np.log2(total / nodes[n]["normal_lat"]), 0, 3)
+    return lat, err, tries, failed, waiting, down
 
-    # traffic flows down. retries mean more traffic to whoever is failing
-    rps = {n: np.zeros(MINUTES) for n in nodes}
-    for n in reversed(order):
-        if nodes[n]["kind"] == "gateway":
-            trend = np.linspace(1, r.uniform(0.8, 1.25), MINUTES)
-            if noise["spike"]:
-                trend = trend * np.where(t >= noise["spike"][0], noise["spike"][1], 1)
-            rps[n] = nodes[n]["rps"] * trend * rng.lognormal(0, 0.03, MINUTES)
+
+def traffic(system, gateway_rps, tries, failed, down, lost):
+    # traffic flows down. retries mean more traffic to whoever is failing, cache misses go to the db
+    nodes, edges = system["nodes"], system["edges"]
+    rps = {n: np.zeros(SIM) for n in nodes}
+    for n in reversed(system["order"]):
+        if n in gateway_rps:
+            rps[n] = gateway_rps[n]
         sending = np.where(down[n], 0, rps[n])
-        for c in callees[n]:
-            rps[c] = rps[c] + sending * edges[(n, c)]["calls"] * tries[(n, c)] * (1 - lost[c])
+        for c in system["callees"][n]:
+            e = edges[(n, c)]
+            rps[c] = rps[c] + sending * e["calls"] * tries[(n, c)] * (1 - lost[c])
+            backing = nodes[c].get("backing")
+            if backing:
+                rps[backing] = rps[backing] + sending * e["calls"] * failed[(n, c)]
+    return rps
+
+
+def simulate(r, system, roots, noise):
+    nodes = system["nodes"]
+    rng = np.random.default_rng(r.getrandbits(32))
+    t = np.arange(SIM)
+    system["callees"] = {n: [b for (a, b) in system["edges"] if a == n] for n in nodes}
+
+    own_lat = {n: info["own_lat"] * rng.lognormal(0, 0.04, SIM) for n, info in nodes.items()}
+    own_err = {n: np.full(SIM, info["base_err"]) for n, info in nodes.items()}
+    cpu_extra = {n: np.zeros(SIM) for n in nodes}
+    down = {n: np.zeros(SIM, bool) for n in nodes}
+    lost = {n: np.zeros(SIM) for n in nodes}
+
+    for n in noise["flaky"]:
+        own_err[n] = rng.uniform(0.02, 0.06) + (rng.random(SIM) < 0.12) * rng.uniform(0.05, 0.15, SIM)
+    for n, period, offset in noise["cron"]:
+        busy = ((t - offset) % period) < 2
+        own_lat[n] = own_lat[n] * np.where(busy, rng.uniform(2, 4), 1)
+        cpu_extra[n] += busy * rng.uniform(25, 40)
+    for n, minute in noise["deploys"]:
+        own_lat[n][minute + MAX_SKEW] *= 1.6  # restart blip
+        cpu_extra[n][minute + MAX_SKEW] += 15
+    for f in roots:
+        apply_fault(rng, dict(f, t0=f["t0"] + MAX_SKEW), own_lat, own_err, cpu_extra, down, lost, t)
+
+    gateway_rps = {}
+    for n, info in nodes.items():
+        if info["kind"] == "gateway":
+            trend = np.linspace(1, r.uniform(0.8, 1.25), SIM)
+            if noise["spike"]:
+                trend = trend * np.where(t >= noise["spike"][0] + MAX_SKEW, noise["spike"][1], 1)
+            gateway_rps[n] = info["rps"] * trend * rng.lognormal(0, 0.03, SIM)
+
+    # run it twice: the first pass tells us who got flooded, the second lets the flooded ones fail too
+    slow = {n: np.ones(SIM) for n in nodes}
+    extra_err = {n: np.zeros(SIM) for n in nodes}
+    for _ in range(2):
+        lat, err, tries, failed, waiting, down_now = propagate(
+            system, {n: own_lat[n] * slow[n] for n in nodes}, {n: own_err[n] + extra_err[n] for n in nodes}, down, lost)
+        rps = traffic(system, gateway_rps, tries, failed, down_now, lost)
+        for n, info in nodes.items():
+            # way more traffic than it's sized for -> queues build up over a couple of minutes
+            over = np.clip((rps[n] / info["normal_rps"] - 2.5) / 2, 0, 2)
+            for i in range(1, SIM):
+                over[i] = 0.5 * over[i - 1] + 0.5 * over[i]
+            slow[n] = 1 + 6 * over
+            extra_err[n] = np.clip(0.25 * over, 0, 0.6)
+    system["flooded"] = sorted(n for n in nodes if (slow[n] > 2).any() and n not in [f["service"] for f in roots])
 
     cols = {k: [] for k in ("service", "minute", "rps", "latency_ms", "error_rate", "cpu", "log_errors")}
     for n, info in nodes.items():
         reqs = np.maximum(rps[n] * 60, 1).astype(int)
-        cpu = info["cpu_idle"] + info["cpu_per_rps"] * rps[n] + cpu_extra[n] + rng.normal(0, 1.5, MINUTES)
-        gone = down[n] | (rng.random(MINUTES) < 0.004)  # down, or the scrape just failed
+        cpu = info["cpu_idle"] + info["cpu_per_rps"] * rps[n] + cpu_extra[n] + waiting[n] + rng.normal(0, 1.5, SIM)
+        gone = down_now[n] | (rng.random(SIM) < 0.004)  # down, or the scrape just failed
         values = {
             "rps": np.round(rng.poisson(reqs) / 60, 2),
-            "latency_ms": np.round(lat[n] * rng.lognormal(0, 0.06, MINUTES), 1),
+            "latency_ms": np.round(lat[n] * rng.lognormal(0, 0.06, SIM), 1),
             "error_rate": np.round(rng.binomial(reqs, np.clip(err[n], 0, 1)) / reqs, 5),
             "cpu": np.round(np.clip(cpu, 0, 100), 1),
             "log_errors": rng.poisson(reqs * np.clip(err[n], 0, 1) * info["verbose"]).astype(float),
         }
+        if not info["observed"]:
+            continue
+        # host clock is `skew` minutes ahead, so its minute m is really minute m - skew
+        start = MAX_SKEW - info["skew"]
         cols["service"] += [n] * MINUTES
-        cols["minute"].append(t)
+        cols["minute"].append(np.arange(MINUTES))
         for k, v in values.items():
-            cols[k].append(np.where(gone, np.nan, v))
+            cols[k].append(np.where(gone, np.nan, v)[start:start + MINUTES])
     out = pd.DataFrame({k: (v if k == "service" else np.concatenate(v)) for k, v in cols.items()})
     out["log_errors"] = out["log_errors"].astype("Int64")
     return out
@@ -334,6 +396,10 @@ def make_pool(n, split, seed):
             "root_kinds": " ".join(nodes[f["service"]]["kind"] for f in roots),
             "traffic_spike": int(noise["spike"] is not None), "n_flaky": len(noise["flaky"]),
             "cron": int(bool(noise["cron"])), "n_deploys": len(set(noise["deploys"])),
+            "n_hidden": sum(not v["observed"] for v in nodes.values()),
+            "root_hidden": int(any(not nodes[f["service"]]["observed"] for f in roots)),
+            "n_skewed": sum(v["skew"] != 0 for v in nodes.values()),
+            "flooded": len(system["flooded"]),
         }]))
     return {k: pd.concat(v, ignore_index=True) for k, v in tables.items()}
 
