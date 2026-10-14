@@ -54,16 +54,24 @@ def per_service(metrics):
     weird = (z["latency_ms"] > 4) | (z["error_rate"] > 4) | (z["load"] > 4) | gone
     weird[:, :BASE] = False
     steady = weird[:, :-1] & weird[:, 1:]  # two weird minutes in a row
-    f["onset"] = np.where(steady.any(axis=1), steady.argmax(axis=1), 99)
+    f["onset_first"] = np.where(steady.any(axis=1), steady.argmax(axis=1), 99)
+    # real trouble sticks around, a cron job or a blip doesn't. so the onset is where the trouble
+    # starts that's still there most of the time until the end
+    left = np.cumsum(weird[:, ::-1], axis=1)[:, ::-1] / np.arange(MINUTES, 0, -1)
+    lasting = weird & (left >= 0.7)
+    lasting[:, :BASE] = False
+    f["onset"] = np.where(lasting.any(axis=1), lasting.argmax(axis=1), 99)
     for col in ["latency_ms", "error_rate", "cpu"]:
         s = (z[col][:, :-1] > 4) & (z[col][:, 1:] > 4)
         s[:, :BASE] = False
         f[f"{col}_onset"] = np.where(s.any(axis=1), s.argmax(axis=1), 99)
+    late = np.nan_to_num(np.maximum.reduce([np.nanmean(z[c][:, -10:], axis=1) for c in ("latency_ms", "error_rate", "load")]))
+    f["affected"] = ((late > 3) | (gone[:, -10:].sum(axis=1) >= 3)).astype(int)  # still in trouble at the end
     f["missing"] = gone[:, BASE:].sum(axis=1)
     f["weird_minutes"] = weird.sum(axis=1)
     # did traffic jump right before it went weird? (flooded by someone else's failure)
     rps_z = np.nan_to_num(z["rps"], nan=0.0)
-    on = f["onset"].to_numpy()
+    on = f["onset_first"].to_numpy()
     f["rps_before_onset"] = [rps_z[i, max(0, o - 3):o].mean() if 3 <= o < 99 else 0.0 for i, o in enumerate(on)]
     return f
 
@@ -129,7 +137,8 @@ def add_graph(f, calls, deploys):
     for col in ["latency_ms_max", "error_rate_max", "cpu_max", "rps_max"]:
         f[f"{col}_share"] = f[col] / f.groupby("incident_id")[col].transform("max").clip(lower=1e-6)
 
-    onset = dict(zip(zip(f.incident_id, f.service), f.onset))
+    # for the graph only count services that are still in trouble at the end
+    onset = dict(zip(zip(f.incident_id, f.service), np.where(f.affected.fillna(0) == 1, f.onset, 99)))
     down, up = defaultdict(list), defaultdict(list)
     for row in calls.itertuples():
         down[(row.incident_id, row.caller)].append(row.callee)
@@ -144,8 +153,8 @@ def add_graph(f, calls, deploys):
                     todo.append(nxt)
         return seen
 
-    n_weird = (f.onset < 99).groupby(f.incident_id).sum().to_dict()
     is_weird = {k: o < 99 for k, o in onset.items()}
+    n_weird = pd.Series(is_weird.values(), index=[k[0] for k in is_weird]).groupby(level=0).sum().to_dict()
     seen = dict(zip(zip(f.incident_id, f.service), f.observed))
     # weird, and nothing it calls is weird -> the bottom of a weird chain
     bottom = {(i, s): w and not any(is_weird[(i, c)] for c in down[(i, s)]) for (i, s), w in is_weird.items()}
@@ -203,7 +212,7 @@ def build(public, part, use_graph=True):
     if use_graph:
         clock = clock_offsets(metrics, calls)
         f["clock"] = [clock.get(k, 0) for k in zip(f.incident_id, f.service)]
-        for col in ["onset", "latency_ms_onset", "error_rate_onset", "cpu_onset"]:
+        for col in ["onset", "onset_first", "latency_ms_onset", "error_rate_onset", "cpu_onset"]:
             f[col] = np.where(f[col] < 99, f[col] - f.clock, 99)
     # services with no metrics are still suspects, they just have no numbers of their own
     f = pd.read_csv(d / "services.csv").merge(f, on=["incident_id", "service"], how="left")
@@ -230,11 +239,13 @@ if __name__ == "__main__":
     cols = [c for c in train.columns if c not in ("incident_id", "service", "kind")]
     if args.no_graph:
         cols = [c for c in cols if c not in GRAPH]
-    model = HistGradientBoostingClassifier(max_iter=400, learning_rate=0.05, max_leaf_nodes=31,
-                                           l2_regularization=1.0, random_state=0)
-    model.fit(train[cols], y)
-
-    test["score"] = model.predict_proba(test[cols])[:, 1]
+    # 5 models with different seeds, averaged. a bit steadier than one
+    test["score"] = 0.0
+    for seed in range(5):
+        model = HistGradientBoostingClassifier(max_iter=400, learning_rate=0.05, max_leaf_nodes=31,
+                                               l2_regularization=1.0, random_state=seed)
+        model.fit(train[cols], y)
+        test["score"] += model.predict_proba(test[cols])[:, 1] / 5
     test = test.sort_values(["incident_id", "score"], ascending=[True, False])
     sub = test.groupby("incident_id").service.apply(lambda s: " ".join(s.head(3))).reset_index(name="ranking")
     sub.to_csv(out, index=False)
