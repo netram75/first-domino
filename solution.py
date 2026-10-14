@@ -1,6 +1,8 @@
 # reference solution
 # idea: for every service, work out when it started acting weird and how much,
 # then use the call graph - a root cause goes weird first, and the stuff it calls is still fine.
+# v2: host clocks can be off, so line them up first using traffic. services with no metrics
+# still get ranked from their callers.
 # trains from scratch on every run.
 # usage: python solution.py <public_dir> <submission_out> [--no-graph]
 
@@ -19,7 +21,8 @@ KINDS = ["gateway", "service", "db", "cache", "queue"]
 # columns that come from the call graph (dropped with --no-graph)
 GRAPH = ["n_callees", "n_callers", "weird_callees", "callee_earlier", "callee_gap", "weird_callers", "caller_gap",
          "n_above", "weird_above", "weird_below", "explains", "clean_below", "caller_weird_frac", "bottom_callers",
-         "callee_shared_weird"]
+         "callee_shared_weird", "hidden_callees", "sibling_earlier", "clock", "only_suspect_for", "only_suspect_frac"]
+MAX_LAG = 6
 
 
 def per_service(metrics):
@@ -39,8 +42,16 @@ def per_service(metrics):
         f[f"{col}_late"] = np.nanmean(z[col][:, -10:], axis=1).clip(-50, 200)
         f[f"{col}_ratio"] = np.log1p(np.nanmean(x[:, -10:], axis=1).clip(0)) - np.log1p(np.clip(base, 0, None))
 
+    # cpu per request, so a traffic spike (more requests, more cpu) doesn't look like a problem
+    load = (m["cpu"].to_numpy(float) / m["rps"].to_numpy(float).clip(0.01)).reshape(-1, MINUTES)
+    base = np.nanmedian(load[:, :BASE], axis=1)
+    q75, q25 = np.nanpercentile(load[:, :BASE], [75, 25], axis=1)
+    z["load"] = (load - base[:, None]) / ((q75 - q25) + 0.05 * np.abs(base) + 1e-6)[:, None]
+    f["load_max"] = np.nanmax(z["load"][:, BASE:], axis=1).clip(-50, 200)
+    f["load_late"] = np.nanmean(z["load"][:, -10:], axis=1).clip(-50, 200)
+
     gone = np.isnan(m["latency_ms"].to_numpy(float).reshape(-1, MINUTES))
-    weird = (z["latency_ms"] > 4) | (z["error_rate"] > 4) | (z["cpu"] > 4) | gone
+    weird = (z["latency_ms"] > 4) | (z["error_rate"] > 4) | (z["load"] > 4) | gone
     weird[:, :BASE] = False
     steady = weird[:, :-1] & weird[:, 1:]  # two weird minutes in a row
     f["onset"] = np.where(steady.any(axis=1), steady.argmax(axis=1), 99)
@@ -50,11 +61,65 @@ def per_service(metrics):
         f[f"{col}_onset"] = np.where(s.any(axis=1), s.argmax(axis=1), 99)
     f["missing"] = gone[:, BASE:].sum(axis=1)
     f["weird_minutes"] = weird.sum(axis=1)
+    # did traffic jump right before it went weird? (flooded by someone else's failure)
+    rps_z = np.nan_to_num(z["rps"], nan=0.0)
+    on = f["onset"].to_numpy()
+    f["rps_before_onset"] = [rps_z[i, max(0, o - 3):o].mean() if 3 <= o < 99 else 0.0 for i, o in enumerate(on)]
     return f
 
 
-def add_graph(f, services, calls, deploys):
-    f = f.merge(services, on=["incident_id", "service"], how="left")
+def best_lag(caller, callee):
+    # same traffic wiggles show up in caller and callee in the same (real) minute
+    best, best_r = 0, -1.0
+    n = len(callee)
+    for lag in range(-MAX_LAG, MAX_LAG + 1):
+        a = callee[max(0, -lag):min(n, n - lag)]
+        b = caller[max(0, lag):min(n, n + lag)]
+        if a.std() > 0 and b.std() > 0:
+            r = np.corrcoef(a, b)[0, 1]
+            if r > best_r:
+                best, best_r = lag, r
+    return best, best_r
+
+
+def clock_offsets(metrics, calls):
+    m = metrics.sort_values(["incident_id", "service", "minute"])
+    keys = m[["incident_id", "service"]].iloc[::MINUTES]
+    x = pd.DataFrame(np.log(m["rps"].to_numpy(float).reshape(-1, MINUTES).clip(0.01)))
+    x = np.diff(x.interpolate(axis=1, limit_direction="both").to_numpy(), axis=1)
+    series = dict(zip(zip(keys.incident_id, keys.service), x))
+
+    out = {}
+    for inc, g in calls.groupby("incident_id"):
+        links = []
+        for a, b in zip(g.caller, g.callee):
+            if (inc, a) in series and (inc, b) in series:
+                lag, r = best_lag(series[(inc, a)], series[(inc, b)])
+                links.append((r, a, b, lag))
+        # start from the busiest caller and grow along the best matching calls
+        known = {}
+        links.sort(reverse=True)
+        while links:
+            if not known:
+                known[links[0][1]] = 0
+            for i, (r, a, b, lag) in enumerate(links):
+                if (a in known) != (b in known):
+                    if a in known:
+                        known[b] = known[a] - lag
+                    else:
+                        known[a] = known[b] + lag
+                    links.pop(i)
+                    break
+            else:
+                links = [link for link in links if link[1] not in known and link[2] not in known]
+                if links:
+                    known[links[0][1]] = 0  # a part that isn't connected to the rest
+        for s, k in known.items():
+            out[(inc, s)] = k
+    return out
+
+
+def add_graph(f, calls, deploys):
     for k in KINDS:
         f[f"is_{k}"] = (f.kind == k).astype(int)
 
@@ -81,6 +146,7 @@ def add_graph(f, services, calls, deploys):
 
     n_weird = (f.onset < 99).groupby(f.incident_id).sum().to_dict()
     is_weird = {k: o < 99 for k, o in onset.items()}
+    seen = dict(zip(zip(f.incident_id, f.service), f.observed))
     # weird, and nothing it calls is weird -> the bottom of a weird chain
     bottom = {(i, s): w and not any(is_weird[(i, c)] for c in down[(i, s)]) for (i, s), w in is_weird.items()}
     rows = []
@@ -90,6 +156,13 @@ def add_graph(f, services, calls, deploys):
         caller_on = [onset[(inc, c)] for c in callers]
         # if something i call has other callers that are also weird, i'm probably a victim of it
         shared = [sum(is_weird[(inc, o)] for o in up[(inc, c)] if o != s) for c in callees]
+        # something next to me (same callers) went weird before me -> maybe its traffic landed on me
+        siblings = {c for p in callers for c in down[(inc, p)]} - {s}
+        # weird callers that have nothing else to blame: everything else they call looks fine
+        blame = 0
+        for p in callers:
+            if is_weird[(inc, p)]:
+                blame += not any(is_weird[(inc, c)] or not seen[(inc, c)] for c in down[(inc, p)] if c != s)
         above = reach(inc, s, up)    # everything that depends on s
         below = reach(inc, s, down)  # everything s depends on
         weird_above = sum(onset[(inc, a)] < 99 for a in above)
@@ -107,6 +180,10 @@ def add_graph(f, services, calls, deploys):
             "caller_weird_frac": sum(o < 99 for o in caller_on) / max(len(callers), 1),
             "bottom_callers": sum(bottom[(inc, c)] for c in callers),
             "callee_shared_weird": max(shared, default=0),
+            "hidden_callees": sum(not seen[(inc, c)] for c in callees),
+            "sibling_earlier": sum(onset[(inc, c)] < t for c in siblings),
+            "only_suspect_for": blame,
+            "only_suspect_frac": blame / max(len(callers), 1),
         })
     f = pd.concat([f.reset_index(drop=True), pd.DataFrame(rows)], axis=1)
 
@@ -119,10 +196,20 @@ def add_graph(f, services, calls, deploys):
     return f
 
 
-def build(public, part):
+def build(public, part, use_graph=True):
     d = Path(public) / part
-    f = per_service(pd.read_csv(d / "metrics.csv"))
-    return add_graph(f, pd.read_csv(d / "services.csv"), pd.read_csv(d / "calls.csv"), pd.read_csv(d / "deploys.csv"))
+    metrics, calls = pd.read_csv(d / "metrics.csv"), pd.read_csv(d / "calls.csv")
+    f = per_service(metrics)
+    if use_graph:
+        clock = clock_offsets(metrics, calls)
+        f["clock"] = [clock.get(k, 0) for k in zip(f.incident_id, f.service)]
+        for col in ["onset", "latency_ms_onset", "error_rate_onset", "cpu_onset"]:
+            f[col] = np.where(f[col] < 99, f[col] - f.clock, 99)
+    # services with no metrics are still suspects, they just have no numbers of their own
+    f = pd.read_csv(d / "services.csv").merge(f, on=["incident_id", "service"], how="left")
+    f["observed"] = f.onset.notna().astype(int)
+    f["onset"] = f.onset.fillna(99)
+    return add_graph(f, calls, pd.read_csv(d / "deploys.csv"))
 
 
 if __name__ == "__main__":
@@ -133,8 +220,8 @@ if __name__ == "__main__":
     args = ap.parse_args()
     public, out = args.public, args.out
 
-    train = build(public, "train")
-    test = build(public, "test")
+    train = build(public, "train", not args.no_graph)
+    test = build(public, "test", not args.no_graph)
 
     roots = pd.read_csv(Path(public) / "train_labels.csv")
     roots = {(i, s) for i, r in zip(roots.incident_id, roots.root_causes) for s in r.split()}
