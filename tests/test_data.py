@@ -43,3 +43,11 @@ def test_metrics_look_sane():
     assert ok.error_rate.between(0, 1).all()
     assert ok.cpu.between(0, 100).all()
     assert (ok.latency_ms > 0).all()
+
+
+def test_third_party_apis_send_no_metrics():
+    pool = make_pool(20, "test", seed=6)
+    has_metrics = set(zip(pool["metrics"].incident_id, pool["metrics"].service))
+    ext = pool["services"][pool["services"].kind == "external"]
+    assert len(ext) > 0
+    assert not any(k in has_metrics for k in zip(ext.incident_id, ext.service))
