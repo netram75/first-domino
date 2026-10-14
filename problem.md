@@ -13,6 +13,7 @@ Every incident is a separate little system with 45 minutes of per-minute metrics
   - the caller depends on the callee. if the callee is slow or failing, the caller feels it
 - `metrics.csv` - `incident_id, service, minute, rps, latency_ms, error_rate, cpu, log_errors`
   - `latency_ms` is p95. a blank row means no data came in that minute
+  - some services have no rows at all (see below)
 - `deploys.csv` - `incident_id, service, minute` (deploys that happened during the window)
 
 `train_labels.csv` - `incident_id, root_causes`. Usually one service, sometimes two (space separated).
@@ -36,6 +37,9 @@ MAP@3. If the root cause is your first guess you get 1, second guess 1/2, third 
 
 - Services that call a broken service often look much worse than the broken one.
 - There's normal noise in every incident: traffic going up and down, scheduled jobs, services that always throw a few errors, deploys that have nothing to do with the problem.
+- Each service's metrics are stamped by its own host, and some host clocks are a few minutes off. Deploy times come from one central system.
+- Some services don't send metrics at all (third party APIs, some managed databases and caches). They're still in `services.csv` and `calls.csv`, and they can be the root cause.
+- One failure can overload another service that then fails too. The root cause is the one that started it.
 - The test set has bigger systems than train, and a few kinds of trouble that never show up in train.
 
 ## Rules
